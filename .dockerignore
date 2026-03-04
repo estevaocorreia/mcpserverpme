@@ -1,0 +1,9 @@
+**/bin/
+**/obj/
+.git/
+.vscode/
+.vs/
+logs/
+**/*.user
+**/*.suo
+**/*.cache

@@ -1,0 +1,87 @@
+############################################
+# OS / Editor
+############################################
+.DS_Store
+Thumbs.db
+
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.swp
+*.tmp
+
+############################################
+# Visual Studio / Build artifacts
+############################################
+.vs/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+TestResults/
+artifacts/
+
+# MSBuild/Resharper/Rider
+_ReSharper*/
+*.DotSettings.user
+*.rsuser
+*.sln.iml
+
+############################################
+# .NET / Publish outputs
+############################################
+**/publish/
+**/Publish/
+**/*.pdb
+**/*.cache
+**/*.nupkg
+**/*.snupkg
+
+############################################
+# SQLite / Local dev DB (isso pega seu slnx.sqlite)
+############################################
+*.sqlite
+*.sqlite-journal
+*.db
+*.db-journal
+
+############################################
+# MCP / Local runtime configs (opcional)
+############################################
+# Se esses arquivos forem só do seu ambiente local, ignore.
+# Se você QUISER versionar, remova essas linhas.
+.mcp/
+**/.mcp/
+
+############################################
+# Env / Secrets
+############################################
+.env
+.env.*
+secrets.json
+appsettings.*.json
+!appsettings.json
+
+############################################
+# Node (caso tenha front / scripts)
+############################################
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+############################################
+# Misc
+############################################
+*.log
+*.zip
+*.7z
+*.rar

@@ -1,0 +1,8 @@
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otel-collector
+    restart: unless-stopped
+    network_mode: host          # usa a rede do host → localhost funciona direto
+    volumes:
+      - ./otel-config.yaml:/etc/otelcol-contrib/config.yaml

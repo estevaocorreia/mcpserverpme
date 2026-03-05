@@ -13,13 +13,19 @@ public sealed class MeterRepository : IMeterRepository
 {
     private readonly string _connString;
 
+    private readonly string _connStringNetwork;
+
     public MeterRepository(IConfiguration config)
     {
         _connString = config.GetConnectionString("IonData")
             ?? throw new InvalidOperationException("ConnectionStrings:IonData não configurada.");
+
+        _connStringNetwork = config.GetConnectionString("IonNetwork")
+       ?? throw new InvalidOperationException("ConnectionStrings:IonNetwork não configurada.");
     }
 
     private IDbConnection CreateConn() => new SqlConnection(_connString);
+    private IDbConnection CreateNetworkConn() => new SqlConnection(_connStringNetwork);
 
     public async Task<MeterListResult> ListAsync(MeterListRequest request, CancellationToken ct)
     {
@@ -150,7 +156,7 @@ public sealed class MeterRepository : IMeterRepository
         p.Add("@inicio", query.InicioUtc, DbType.DateTime);
         p.Add("@fim", query.FimUtc, DbType.DateTime);
 
-        // Monta SQL com filtros opcionais
+        
         var sql = """
     SELECT TOP (@take)
         S.DisplayName AS DisplayName,
@@ -164,7 +170,7 @@ public sealed class MeterRepository : IMeterRepository
 
         p.Add("@take", take);
 
-        // filtro por DisplayName (IN)
+       
         if (query.DisplayNames is { Count: > 0 })
         {
             var names = query.DisplayNames
@@ -180,7 +186,7 @@ public sealed class MeterRepository : IMeterRepository
             }
         }
 
-        // filtro por Classification (IN)
+       
         if (query.Classifications is { Count: > 0 })
         {
             var cls = query.Classifications
@@ -216,4 +222,107 @@ public sealed class MeterRepository : IMeterRepository
 
     }
 
+
+
+    public async Task<MeterNetworkStatusResult> Meter_NetworkStatusAsync(MeterNetworkStatusRequest request, CancellationToken ct)
+    {
+        var take = Math.Clamp(request.Take, 1, 50000);
+        var search = string.IsNullOrWhiteSpace(request.Search) ? null : $"%{request.Search.Trim()}%";
+        var site = string.IsNullOrWhiteSpace(request.Site) ? null : request.Site.Trim();
+        var enabled = request.Enabled; 
+        var connected = request.Connected; 
+        var siteStatusContains = string.IsNullOrWhiteSpace(request.SiteStatusContains)
+            ? null
+            : $"%{request.SiteStatusContains.Trim()}%";
+
+        
+        const string connectedSql = """
+(
+    [Site Status] LIKE '%Online%'
+    OR [Site Status] LIKE '%Connected%'
+    OR [Site Status] LIKE '%Up%'
+    OR [Site Status] LIKE '%OK%'
+    OR [Site Status] LIKE '%Port Available%'
+)
+""";
+
+        const string disconnectedSql = $"""
+(
+    [Site Status] IS NULL
+    OR LTRIM(RTRIM(CAST([Site Status] AS nvarchar(256)))) = ''
+    OR NOT {connectedSql}
+)
+""";
+
+        var sql = """
+SELECT TOP (@take)
+    CAST([ID] AS bigint) AS Id,
+    COALESCE(CAST([Name] AS nvarchar(256)), '') AS Name,
+    COALESCE(CAST([Type] AS nvarchar(256)), '') AS Type,
+    COALESCE(CAST([Address] AS nvarchar(256)), '') AS Address,
+    COALESCE(CAST([Site] AS nvarchar(256)), '') AS Site,
+    COALESCE(CAST([Site Status] AS nvarchar(256)), '') AS SiteStatus,
+    COALESCE(CAST([Enabled] AS nvarchar(10)), '') AS EnabledText,
+    COALESCE(CAST([Protocol] AS nvarchar(256)), '') AS Protocol,
+    COALESCE(CAST([Description] AS nvarchar(512)), '') AS Description
+FROM [ION_Network].[dbo].[vPMCDevice]
+WHERE 1=1
+  AND (@site IS NULL OR [Site] = @site)
+  AND (
+        @enabled IS NULL
+        OR [Enabled] = CASE WHEN @enabled = 1 THEN 'YES' ELSE 'NO' END
+      )
+  AND (
+       @search IS NULL
+       OR [Name] LIKE @search
+       OR [Address] LIKE @search
+       OR [Description] LIKE @search
+  )
+  AND (@siteStatusContains IS NULL OR [Site Status] LIKE @siteStatusContains)
+""";
+
+       
+        if (connected.HasValue)
+        {
+            sql += connected.Value
+                ? $"\n AND {connectedSql}\n"
+                : $"\n AND {disconnectedSql}\n";
+        }
+
+        sql += "\n ORDER BY [Site], [Name];";
+
+        using var conn = CreateNetworkConn();
+
+        var rows = (await conn.QueryAsync<MeterNetworkStatusRow>(
+            new CommandDefinition(sql, new { take, search, site, enabled, siteStatusContains }, cancellationToken: ct)
+        )).AsList();
+
+      
+        foreach (var r in rows)
+        {
+            r.IsEnabled =
+                r.EnabledText.Equals("YES", StringComparison.OrdinalIgnoreCase) ||
+                r.EnabledText.Equals("1", StringComparison.OrdinalIgnoreCase) ||
+                r.EnabledText.Equals("TRUE", StringComparison.OrdinalIgnoreCase);
+
+            var st = (r.SiteStatus ?? "").Trim();
+
+            r.IsConnected =
+                r.IsEnabled &&
+                (st.Contains("online", StringComparison.OrdinalIgnoreCase)
+                 || st.Contains("connected", StringComparison.OrdinalIgnoreCase)
+                 || st.Contains("up", StringComparison.OrdinalIgnoreCase)
+                 || st.Contains("ok", StringComparison.OrdinalIgnoreCase)
+                 || st.Contains("port available", StringComparison.OrdinalIgnoreCase));
+        }
+
+        return new MeterNetworkStatusResult
+        {
+            Returned = rows.Count,
+            Items = rows,
+            Source = "ION_Network.dbo.vPMCDevice (Enabled YES/NO + Connected filter)"
+        };
     }
+
+
+}

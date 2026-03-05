@@ -103,5 +103,6 @@ public sealed class MeterService : IMeterService
         return _repo.Meter_EventsByClassificationAsync(query, ct);
     }
 
-
+    public Task<MeterNetworkStatusResult> Meter_NetworkStatusAsync(MeterNetworkStatusRequest request, CancellationToken ct)
+            => _repo.Meter_NetworkStatusAsync(request, ct);
 }

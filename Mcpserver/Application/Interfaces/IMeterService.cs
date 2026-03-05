@@ -11,4 +11,6 @@ public interface IMeterService
 
     Task<MeterEventsByClassificationResult> Meter_EventsByClassificationAsync(MeterEventsByClassificationRequest request, CancellationToken ct);
 
+    Task<MeterNetworkStatusResult> Meter_NetworkStatusAsync(MeterNetworkStatusRequest request, CancellationToken ct);
+
 }

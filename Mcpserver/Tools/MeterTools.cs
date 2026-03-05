@@ -217,4 +217,27 @@ public sealed class MeterTools
 
 
 
-}
+    [McpServerTool]
+    [Description("Meter: lista status dos medidores no ION_Network (vPMCDevice) e indica se está conectado/desconectado.")]
+    public async Task<MeterNetworkStatusResult> Meter_NetworkStatus(
+    [Description("Filtros: Search, Site, Enabled, Take")] MeterNetworkStatusRequest? req,
+    CancellationToken ct)
+    {
+        try
+        {
+            req ??= new MeterNetworkStatusRequest();
+            return await _service.Meter_NetworkStatusAsync(req, ct);
+        }
+        catch (Exception ex)
+        {
+            return new MeterNetworkStatusResult
+            {
+                Returned = 0,
+                Items = new List<MeterNetworkStatusRow>(),
+                Source = "ERROR: " + ex.Message
+            };
+        }
+
+
+      }
+    }

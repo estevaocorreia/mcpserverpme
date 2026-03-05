@@ -12,4 +12,6 @@ public interface IMeterRepository
     Task<MeterDemandResult> Meter_DemandAsync(MeterDemandQuery query, CancellationToken ct);
     Task<MeterEventsByClassificationResult> Meter_EventsByClassificationAsync(Mcpserver.Models.MeterEventsByClassificationQuery query, CancellationToken ct);
 
+    Task<MeterNetworkStatusResult> Meter_NetworkStatusAsync(MeterNetworkStatusRequest request, CancellationToken ct);
+
 }

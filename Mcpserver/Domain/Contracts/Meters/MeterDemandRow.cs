@@ -4,7 +4,7 @@ public sealed class MeterDemandRow
 {
     public string NomeMedidor { get; set; } = "";
 
-    public decimal? Demanda_kW { get; set; }
+    public decimal? Demanda { get; set; }
 
     public DateTime PeriodoLocal { get; set; }
     public DateTime PeriodoFinalLocal { get; set; }

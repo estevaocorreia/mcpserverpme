@@ -21,4 +21,4 @@ EXPOSE 8080
 COPY --from=build /app/publish .
 
 # Start em modo HTTP
-ENTRYPOINT ["dotnet", "Mcpserver.dll", "--http"]
+ENTRYPOINT ["/app/Mcpserver", "--http"]

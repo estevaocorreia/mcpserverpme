@@ -6,6 +6,7 @@ using Mcpserver.Shared.Observability;
 using Mcpserver.Tools;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -297,14 +298,29 @@ app.Lifetime.ApplicationStopping.Register(() =>
     lifetimeCts.Cancel();
 });
 
-app.MapGet("/health", () => new
+app.MapGet("/health", (HttpContext ctx) =>
 {
-    ok = true,
-    service = "mcpserver",
-    mode = "http",
-    utc = DateTime.UtcNow,
-    machine = Environment.MachineName,
-    pid = Environment.ProcessId
+    Log.Information(
+        "HEALTH REQ Method={Method} Path={Path} UserAgent={UserAgent} RemoteIp={RemoteIp}",
+        ctx.Request.Method,
+        ctx.Request.Path,
+        ctx.Request.Headers.UserAgent.ToString(),
+        ctx.Connection.RemoteIpAddress?.ToString() ?? ""
+    );
+
+    Console.WriteLine(
+        $"[HEALTH REQ] Method={ctx.Request.Method} Path={ctx.Request.Path} UserAgent={ctx.Request.Headers.UserAgent} RemoteIp={ctx.Connection.RemoteIpAddress}"
+    );
+
+    return new
+    {
+        ok = true,
+        service = "mcpserver",
+        mode = "http",
+        utc = DateTime.UtcNow,
+        machine = Environment.MachineName,
+        pid = Environment.ProcessId
+    };
 });
 
 app.UseCors("mcp");

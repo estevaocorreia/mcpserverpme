@@ -167,13 +167,13 @@ ConfigureOtel(web.Services.AddOpenTelemetry(), web.Configuration);
 var app = web.Build();
 
 // Healthcheck simples
-app.MapGet("/health", () => Results.Ok(new
+app.MapGet("/health", () => new
 {
     ok = true,
     service = "mcpserver",
     mode = "http",
     utc = DateTime.UtcNow
-}));
+});
 
 app.UseCors("mcp");
 app.UseRouting();

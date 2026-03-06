@@ -12,6 +12,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using ModelContextProtocol.Server;
 using OpenTelemetry;
+using OpenTelemetry.Exporter;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
@@ -23,26 +24,24 @@ var useHttp = args.Any(a => a.Equals("--http", StringComparison.OrdinalIgnoreCas
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-// Lê o endpoint do OTel do appsettings (ex: http://localhost:4317)
-static string GetOtelEndpoint(Microsoft.Extensions.Configuration.IConfiguration cfg)
+static string GetOtelEndpoint(IConfiguration cfg)
     => cfg["OpenTelemetry:Endpoint"] ?? "http://localhost:4317";
 
-// Constrói o ResourceBuilder com info do serviço
 static ResourceBuilder BuildResource()
     => ResourceBuilder.CreateDefault()
         .AddService("mcpserver", serviceVersion: "1.0.0");
 
-// Configura o Serilog lendo do appsettings + sink OpenTelemetry para logs
 static Serilog.Core.Logger BuildSerilog(
-    Microsoft.Extensions.Configuration.IConfiguration cfg,
+    IConfiguration cfg,
     ConfigurationReaderOptions opts)
 {
     var otelEndpoint = GetOtelEndpoint(cfg);
+
     return new LoggerConfiguration()
         .ReadFrom.Configuration(cfg, opts)
         .WriteTo.OpenTelemetry(o =>
         {
-            o.Endpoint = otelEndpoint + "/v1/logs"; // OTLP HTTP
+            o.Endpoint = otelEndpoint + "/v1/logs";
             o.Protocol = OtlpProtocol.HttpProtobuf;
             o.ResourceAttributes = new Dictionary<string, object>
             {
@@ -53,10 +52,9 @@ static Serilog.Core.Logger BuildSerilog(
         .CreateLogger();
 }
 
-// Configura OpenTelemetry (métricas + traces) com exporter OTLP
 static IOpenTelemetryBuilder ConfigureOtel(
     IOpenTelemetryBuilder otel,
-    Microsoft.Extensions.Configuration.IConfiguration cfg)
+    IConfiguration cfg)
 {
     var endpoint = new Uri(GetOtelEndpoint(cfg));
 
@@ -69,7 +67,7 @@ static IOpenTelemetryBuilder ConfigureOtel(
             .AddOtlpExporter(o =>
             {
                 o.Endpoint = endpoint;
-                o.Protocol = OpenTelemetry.Exporter.OtlpExportProtocol.Grpc;
+                o.Protocol = OtlpExportProtocol.Grpc;
             }))
         .WithMetrics(m => m
             .SetResourceBuilder(BuildResource())
@@ -80,8 +78,20 @@ static IOpenTelemetryBuilder ConfigureOtel(
             .AddOtlpExporter(o =>
             {
                 o.Endpoint = endpoint;
-                o.Protocol = OpenTelemetry.Exporter.OtlpExportProtocol.Grpc;
+                o.Protocol = OtlpExportProtocol.Grpc;
             }));
+}
+
+static void RegisterAppServices(IServiceCollection services, IConfiguration configuration)
+{
+    services.AddDbContext<AppDbContext>(opt =>
+        opt.UseSqlServer(configuration.GetConnectionString("Default")));
+
+    services.AddScoped<IAlarmRepository, AlarmRepository>();
+    services.AddScoped<AlarmService>();
+
+    services.AddScoped<IMeterRepository, MeterRepository>();
+    services.AddScoped<IMeterService, MeterService>();
 }
 
 // Opções do Serilog para single-file publish
@@ -99,13 +109,7 @@ if (!useHttp)
     builder.Logging.ClearProviders();
     builder.Logging.AddSerilog(Log.Logger, dispose: true);
 
-    builder.Services.AddDbContext<AppDbContext>(opt =>
-        opt.UseSqlServer(builder.Configuration.GetConnectionString("Default")));
-
-    builder.Services.AddScoped<IAlarmRepository, AlarmRepository>();
-    builder.Services.AddScoped<AlarmService>();
-    builder.Services.AddScoped<IMeterRepository, MeterRepository>();
-    builder.Services.AddScoped<IMeterService, MeterService>();
+    RegisterAppServices(builder.Services, builder.Configuration);
 
     builder.Services
         .AddMcpServer()
@@ -140,16 +144,16 @@ Log.Logger = BuildSerilog(web.Configuration, serilogOpts);
 web.Logging.ClearProviders();
 web.Logging.AddSerilog(Log.Logger, dispose: true);
 
-web.Services.AddDbContext<AppDbContext>(opt =>
-    opt.UseSqlServer(web.Configuration.GetConnectionString("Default")));
+RegisterAppServices(web.Services, web.Configuration);
 
-web.Services.AddCors(o =>
-    o.AddPolicy("mcp", p => p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
-
-web.Services.AddScoped<IAlarmRepository, AlarmRepository>();
-web.Services.AddScoped<AlarmService>();
-web.Services.AddScoped<IMeterRepository, MeterRepository>();
-web.Services.AddScoped<IMeterService, MeterService>();
+web.Services.AddCors(options =>
+{
+    options.AddPolicy("mcp", policy =>
+        policy
+            .AllowAnyOrigin()
+            .AllowAnyHeader()
+            .AllowAnyMethod());
+});
 
 web.Services
     .AddMcpServer()
@@ -161,13 +165,61 @@ web.Services
 ConfigureOtel(web.Services.AddOpenTelemetry(), web.Configuration);
 
 var app = web.Build();
+
+// Healthcheck simples
+app.MapGet("/health", () => Results.Ok(new
+{
+    ok = true,
+    service = "mcpserver",
+    mode = "http",
+    utc = DateTime.UtcNow
+}));
+
 app.UseCors("mcp");
 app.UseRouting();
+
+// Log de entrada no /mcp
+app.Use(async (ctx, next) =>
+{
+    if (ctx.Request.Path.StartsWithSegments("/mcp"))
+    {
+        Log.Information(
+            "MCP REQ Method={Method} Path={Path} QueryString={QueryString} Accept={Accept} ContentType={ContentType} UserAgent={UserAgent}",
+            ctx.Request.Method,
+            ctx.Request.Path,
+            ctx.Request.QueryString.ToString(),
+            ctx.Request.Headers.Accept.ToString(),
+            ctx.Request.ContentType ?? "",
+            ctx.Request.Headers.UserAgent.ToString()
+        );
+    }
+
+    await next();
+
+    if (ctx.Request.Path.StartsWithSegments("/mcp"))
+    {
+        Log.Information(
+            "MCP RESP Method={Method} Path={Path} StatusCode={StatusCode} ResponseContentType={ResponseContentType}",
+            ctx.Request.Method,
+            ctx.Request.Path,
+            ctx.Response.StatusCode,
+            ctx.Response.ContentType ?? ""
+        );
+    }
+});
+
+// Endpoint MCP
 app.MapMcp("/mcp");
 
 try
 {
+    Log.Information("Iniciando MCP HTTP em /mcp");
     app.Run();
+}
+catch (Exception ex)
+{
+    Log.Fatal(ex, "MCP HTTP finalizou com erro");
+    throw;
 }
 finally
 {

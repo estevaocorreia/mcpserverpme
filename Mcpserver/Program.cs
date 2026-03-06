@@ -5,6 +5,7 @@ using Mcpserver.Infrastructure.Repositories;
 using Mcpserver.Shared.Observability;
 using Mcpserver.Tools;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -21,8 +22,6 @@ using Serilog.Settings.Configuration;
 using Serilog.Sinks.OpenTelemetry;
 
 var useHttp = args.Any(a => a.Equals("--http", StringComparison.OrdinalIgnoreCase));
-
-// ── Helpers ────────────────────────────────────────────────────────────────
 
 static string GetOtelEndpoint(IConfiguration cfg)
     => cfg["OpenTelemetry:Endpoint"] ?? "http://localhost:4317";
@@ -89,18 +88,15 @@ static void RegisterAppServices(IServiceCollection services, IConfiguration conf
 
     services.AddScoped<IAlarmRepository, AlarmRepository>();
     services.AddScoped<AlarmService>();
-
     services.AddScoped<IMeterRepository, MeterRepository>();
     services.AddScoped<IMeterService, MeterService>();
 }
 
-// Opções do Serilog para single-file publish
 var serilogOpts = new ConfigurationReaderOptions(
     typeof(ConsoleLoggerConfigurationExtensions).Assembly,
     typeof(Serilog.Sinks.File.FileSink).Assembly
 );
 
-// ── Modo STDIO ─────────────────────────────────────────────────────────────
 if (!useHttp)
 {
     var builder = Host.CreateApplicationBuilder(args);
@@ -137,7 +133,6 @@ if (!useHttp)
     return;
 }
 
-// ── Modo HTTP ──────────────────────────────────────────────────────────────
 var web = WebApplication.CreateBuilder(args);
 
 Log.Logger = BuildSerilog(web.Configuration, serilogOpts);
@@ -145,6 +140,8 @@ web.Logging.ClearProviders();
 web.Logging.AddSerilog(Log.Logger, dispose: true);
 
 RegisterAppServices(web.Services, web.Configuration);
+
+web.WebHost.UseUrls("http://0.0.0.0:8080");
 
 web.Services.AddCors(options =>
 {
@@ -166,7 +163,6 @@ ConfigureOtel(web.Services.AddOpenTelemetry(), web.Configuration);
 
 var app = web.Build();
 
-// Healthcheck simples
 app.MapGet("/health", () => new
 {
     ok = true,
@@ -178,11 +174,13 @@ app.MapGet("/health", () => new
 app.UseCors("mcp");
 app.UseRouting();
 
-// Log de entrada no /mcp
 app.Use(async (ctx, next) =>
 {
     if (ctx.Request.Path.StartsWithSegments("/mcp"))
     {
+        ctx.Response.Headers["Cache-Control"] = "no-cache";
+        ctx.Response.Headers["X-Accel-Buffering"] = "no";
+
         Log.Information(
             "MCP REQ Method={Method} Path={Path} QueryString={QueryString} Accept={Accept} ContentType={ContentType} UserAgent={UserAgent}",
             ctx.Request.Method,
@@ -208,12 +206,11 @@ app.Use(async (ctx, next) =>
     }
 });
 
-// Endpoint MCP
 app.MapMcp("/mcp");
 
 try
 {
-    Log.Information("Iniciando MCP HTTP em /mcp");
+    Log.Information("Iniciando MCP HTTP em http://0.0.0.0:8080/mcp");
     app.Run();
 }
 catch (Exception ex)

@@ -163,7 +163,7 @@ ConfigureOtel(web.Services.AddOpenTelemetry(), web.Configuration);
 var app = web.Build();
 app.UseCors("mcp");
 app.UseRouting();
-app.MapMcp();
+app.MapMcp("/mcp");
 
 try
 {

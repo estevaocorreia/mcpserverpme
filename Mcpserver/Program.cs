@@ -18,8 +18,37 @@ using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using Serilog;
+using Serilog.Events;
 using Serilog.Settings.Configuration;
 using Serilog.Sinks.OpenTelemetry;
+
+AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+{
+    try
+    {
+        var ex = e.ExceptionObject as Exception;
+        Log.Fatal(ex, "Unhandled exception capturada pelo AppDomain. IsTerminating={IsTerminating}", e.IsTerminating);
+        Console.Error.WriteLine($"[FATAL] UnhandledException capturada. IsTerminating={e.IsTerminating}. Exception={ex}");
+    }
+    catch (Exception logEx)
+    {
+        Console.Error.WriteLine($"[FATAL] Falha ao registrar UnhandledException: {logEx}");
+    }
+};
+
+TaskScheduler.UnobservedTaskException += (_, e) =>
+{
+    try
+    {
+        Log.Fatal(e.Exception, "Unobserved task exception capturada pelo TaskScheduler");
+        Console.Error.WriteLine($"[FATAL] UnobservedTaskException capturada: {e.Exception}");
+        e.SetObserved();
+    }
+    catch (Exception logEx)
+    {
+        Console.Error.WriteLine($"[FATAL] Falha ao registrar UnobservedTaskException: {logEx}");
+    }
+};
 
 var useHttp = args.Any(a => a.Equals("--http", StringComparison.OrdinalIgnoreCase));
 
@@ -37,6 +66,11 @@ static Serilog.Core.Logger BuildSerilog(
     var otelEndpoint = GetOtelEndpoint(cfg);
 
     return new LoggerConfiguration()
+        .MinimumLevel.Information()
+        .MinimumLevel.Override("Microsoft", LogEventLevel.Information)
+        .MinimumLevel.Override("System", LogEventLevel.Information)
+        .Enrich.FromLogContext()
+        .WriteTo.Console()
         .ReadFrom.Configuration(cfg, opts)
         .WriteTo.OpenTelemetry(o =>
         {
@@ -97,11 +131,15 @@ var serilogOpts = new ConfigurationReaderOptions(
     typeof(Serilog.Sinks.File.FileSink).Assembly
 );
 
+// ─────────────────────────────────────────────────────────────────────────────
+// MODO STDIO
+// ─────────────────────────────────────────────────────────────────────────────
 if (!useHttp)
 {
     var builder = Host.CreateApplicationBuilder(args);
 
     Log.Logger = BuildSerilog(builder.Configuration, serilogOpts);
+
     builder.Logging.ClearProviders();
     builder.Logging.AddSerilog(Log.Logger, dispose: true);
 
@@ -118,11 +156,37 @@ if (!useHttp)
 
     try
     {
-        await builder.Build().RunAsync();
+        Log.Information("Iniciando MCP em modo STDIO");
+        Console.WriteLine("[INFO] Iniciando MCP em modo STDIO");
+
+        var host = builder.Build();
+
+        var lifetime = host.Services.GetRequiredService<IHostApplicationLifetime>();
+
+        lifetime.ApplicationStarted.Register(() =>
+        {
+            Log.Information("STDIO ApplicationStarted disparado");
+            Console.WriteLine("[INFO] STDIO ApplicationStarted disparado");
+        });
+
+        lifetime.ApplicationStopping.Register(() =>
+        {
+            Log.Warning("STDIO ApplicationStopping disparado");
+            Console.WriteLine("[WARN] STDIO ApplicationStopping disparado");
+        });
+
+        lifetime.ApplicationStopped.Register(() =>
+        {
+            Log.Warning("STDIO ApplicationStopped disparado");
+            Console.WriteLine("[WARN] STDIO ApplicationStopped disparado");
+        });
+
+        await host.RunAsync();
     }
     catch (Exception ex)
     {
         Log.Fatal(ex, "MCP STDIO finalizou com erro");
+        Console.Error.WriteLine($"[FATAL] MCP STDIO finalizou com erro: {ex}");
         throw;
     }
     finally
@@ -133,9 +197,13 @@ if (!useHttp)
     return;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// MODO HTTP
+// ─────────────────────────────────────────────────────────────────────────────
 var web = WebApplication.CreateBuilder(args);
 
 Log.Logger = BuildSerilog(web.Configuration, serilogOpts);
+
 web.Logging.ClearProviders();
 web.Logging.AddSerilog(Log.Logger, dispose: true);
 
@@ -163,12 +231,80 @@ ConfigureOtel(web.Services.AddOpenTelemetry(), web.Configuration);
 
 var app = web.Build();
 
+app.Lifetime.ApplicationStarted.Register(() =>
+{
+    Log.Information("HTTP ApplicationStarted disparado");
+    Console.WriteLine("[INFO] HTTP ApplicationStarted disparado");
+});
+
+app.Lifetime.ApplicationStopping.Register(() =>
+{
+    Log.Warning("HTTP ApplicationStopping disparado");
+    Console.WriteLine("[WARN] HTTP ApplicationStopping disparado");
+});
+
+app.Lifetime.ApplicationStopped.Register(() =>
+{
+    Log.Warning("HTTP ApplicationStopped disparado");
+    Console.WriteLine("[WARN] HTTP ApplicationStopped disparado");
+});
+
+var lifetimeCts = new CancellationTokenSource();
+
+_ = Task.Run(async () =>
+{
+    while (!lifetimeCts.Token.IsCancellationRequested)
+    {
+        try
+        {
+            var proc = System.Diagnostics.Process.GetCurrentProcess();
+
+            var workingSetMb = Math.Round(proc.WorkingSet64 / 1024d / 1024d, 2);
+            var privateMemoryMb = Math.Round(proc.PrivateMemorySize64 / 1024d / 1024d, 2);
+            var threads = proc.Threads.Count;
+
+            Log.Information(
+                "Heartbeat PID={Pid} WorkingSetMB={WorkingSetMB} PrivateMemoryMB={PrivateMemoryMB} Threads={Threads}",
+                Environment.ProcessId,
+                workingSetMb,
+                privateMemoryMb,
+                threads
+            );
+
+            Console.WriteLine(
+                $"[HEARTBEAT] PID={Environment.ProcessId} WorkingSetMB={workingSetMb} PrivateMemoryMB={privateMemoryMb} Threads={threads}"
+            );
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Falha ao registrar heartbeat");
+            Console.Error.WriteLine($"[WARN] Falha ao registrar heartbeat: {ex}");
+        }
+
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(30), lifetimeCts.Token);
+        }
+        catch (TaskCanceledException)
+        {
+            break;
+        }
+    }
+});
+
+app.Lifetime.ApplicationStopping.Register(() =>
+{
+    lifetimeCts.Cancel();
+});
+
 app.MapGet("/health", () => new
 {
     ok = true,
     service = "mcpserver",
     mode = "http",
-    utc = DateTime.UtcNow
+    utc = DateTime.UtcNow,
+    machine = Environment.MachineName,
+    pid = Environment.ProcessId
 });
 
 app.UseCors("mcp");
@@ -190,6 +326,10 @@ app.Use(async (ctx, next) =>
             ctx.Request.ContentType ?? "",
             ctx.Request.Headers.UserAgent.ToString()
         );
+
+        Console.WriteLine(
+            $"[MCP REQ] Method={ctx.Request.Method} Path={ctx.Request.Path} QueryString={ctx.Request.QueryString} Accept={ctx.Request.Headers.Accept} ContentType={ctx.Request.ContentType ?? ""} UserAgent={ctx.Request.Headers.UserAgent}"
+        );
     }
 
     await next();
@@ -203,6 +343,10 @@ app.Use(async (ctx, next) =>
             ctx.Response.StatusCode,
             ctx.Response.ContentType ?? ""
         );
+
+        Console.WriteLine(
+            $"[MCP RESP] Method={ctx.Request.Method} Path={ctx.Request.Path} StatusCode={ctx.Response.StatusCode} ResponseContentType={ctx.Response.ContentType ?? ""}"
+        );
     }
 });
 
@@ -211,11 +355,14 @@ app.MapMcp("/mcp");
 try
 {
     Log.Information("Iniciando MCP HTTP em http://0.0.0.0:8080/mcp");
+    Console.WriteLine("[INFO] Iniciando MCP HTTP em http://0.0.0.0:8080/mcp");
+
     app.Run();
 }
 catch (Exception ex)
 {
     Log.Fatal(ex, "MCP HTTP finalizou com erro");
+    Console.Error.WriteLine($"[FATAL] MCP HTTP finalizou com erro: {ex}");
     throw;
 }
 finally

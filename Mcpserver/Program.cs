@@ -422,6 +422,24 @@ app.Use(async (ctx, next) =>
             $"[MCP REQ] Method={ctx.Request.Method} Path={ctx.Request.Path} " +
             $"QueryString={ctx.Request.QueryString} Accept={ctx.Request.Headers.Accept} " +
             $"ContentType={ctx.Request.ContentType ?? ""} UserAgent={ctx.Request.Headers.UserAgent}");
+
+        var authHeader = ctx.Request.Headers.Authorization.ToString();
+        var hasAuth = !string.IsNullOrWhiteSpace(authHeader);
+        var authPrefix =
+            string.IsNullOrWhiteSpace(authHeader) ? "none" :
+            authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase) ? "Bearer" :
+            "other";
+
+        var headerNames = string.Join(", ", ctx.Request.Headers.Keys);
+
+        Log.Information(
+            "MCP AUTH HEADER PRESENT={HasAuth} PREFIX={Prefix} HEADERS={Headers}",
+            hasAuth,
+            authPrefix,
+            headerNames);
+
+        Console.WriteLine(
+            $"[MCP AUTH] PRESENT={hasAuth} PREFIX={authPrefix} HEADERS={headerNames}");
     }
 
     await next();

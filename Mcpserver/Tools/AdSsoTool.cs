@@ -21,20 +21,16 @@ public sealed class AdSsoTool
     }
 
     [McpServerTool]
-    [Description("Autentica o usuário via token Bearer enviado na requisição. Se necessário, aceita fallback pelo body.")]
+    [Description("Autentica automaticamente o usuário atual usando a conexão corporativa e retorna seus dados do Active Directory.")]
     public async Task<AdAuthResult> AD_Authenticate(
         RequestContext<CallToolRequestParams> context,
-        [Description("Opcional. Fallback para testes manuais quando não houver header Authorization.")] AdAuthRequest? req,
         CancellationToken ct)
     {
-        req ??= new AdAuthRequest();
-
         var mcpClient = context.Server.ClientInfo?.Name ?? "unknown";
 
         _logger.LogInformation(
-            "Chamada recebida na tool AD_Authenticate. ClienteMcp={McpClient} TemTokenNoBody={HasBodyToken}",
-            mcpClient,
-            !string.IsNullOrWhiteSpace(req.TeamsToken));
+            "Chamada recebida na tool AD_Authenticate. ClienteMcp={McpClient}",
+            mcpClient);
 
         using var activity = McpMetrics.ActivitySource.StartActivity("ad_authenticate");
         var sw = Stopwatch.StartNew();
@@ -48,9 +44,8 @@ public sealed class AdSsoTool
             });
 
             activity?.SetTag("mcp.client", mcpClient);
-            activity?.SetTag("has_body_token", !string.IsNullOrWhiteSpace(req.TeamsToken));
 
-            var result = await _service.AuthenticateAsync(req, ct);
+            var result = await _service.AuthenticateAsync(ct);
 
             _logger.LogInformation(
                 "Resultado da autenticação. ClienteMcp={McpClient} Autenticado={Authenticated} Upn={Upn}",
@@ -62,13 +57,6 @@ public sealed class AdSsoTool
             activity?.SetTag("authenticated", result.Authenticated);
             activity?.SetTag("user.upn", upn);
             activity?.SetTag("user.name", result.User?.DisplayName);
-
-            McpMetrics.ToolCalls.Add(0, new TagList
-            {
-                { "tool", "ad_authenticate" },
-                { "user", upn },
-                { "authenticated", result.Authenticated }
-            });
 
             return result;
         }

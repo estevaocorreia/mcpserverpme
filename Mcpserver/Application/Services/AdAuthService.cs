@@ -32,22 +32,21 @@ public sealed class AdAuthService : IAdAuthService
         _logger = logger;
     }
 
-    public async Task<AdAuthResult> AuthenticateAsync(AdAuthRequest req, CancellationToken ct)
+    public async Task<AdAuthResult> AuthenticateAsync(CancellationToken ct)
     {
-        var accessToken = ResolveAccessToken(req);
+        var accessToken = ResolveAccessToken();
 
         if (string.IsNullOrWhiteSpace(accessToken))
         {
-            _logger.LogWarning("Autenticação falhou: token não encontrado no header Authorization nem no body.");
-            return Fail("Token de acesso não encontrado no header Authorization nem no body.");
+            _logger.LogWarning("Autenticação falhou: token não encontrado no header Authorization.");
+            return Fail("Token de acesso não encontrado no header Authorization.");
         }
 
         string upn;
         try
         {
-            upn = await ValidateTeamsTokenAsync(accessToken, ct);
-
-            _logger.LogInformation("Token validado com sucesso. UPN extraído: {Upn}", upn);
+            upn = await ValidateAccessTokenAsync(accessToken, ct);
+            _logger.LogInformation("Token validado com sucesso. UPN={Upn}", upn);
         }
         catch (SecurityTokenException ex)
         {
@@ -62,46 +61,17 @@ public sealed class AdAuthService : IAdAuthService
             using var conn = CreateConnection();
             BindServiceAccount(conn);
 
-            _logger.LogInformation(
-                "Consultando usuário no AD. SamAccount={SamAccount} Upn={Upn} Host={Host} BaseDn={BaseDn}",
-                samAccount, upn, _ad.Host, _ad.BaseDn);
-
             var user = SearchUser(conn, samAccount, upn);
 
             if (user is null)
-            {
-                _logger.LogWarning(
-                    "Usuário autenticado no token, mas não encontrado no AD. Upn={Upn} SamAccount={SamAccount}",
-                    upn, samAccount);
-
                 return Fail($"Usuário '{upn}' autenticado, mas não encontrado no AD.");
-            }
 
             if (!user.Enabled)
-            {
-                _logger.LogWarning(
-                    "Usuário encontrado no AD, mas conta está desativada. Upn={Upn} SamAccount={SamAccount}",
-                    upn, samAccount);
-
                 return Fail($"Conta '{samAccount}' está desativada no Active Directory.");
-            }
 
             _logger.LogInformation(
-                "Usuário autenticado com sucesso. Upn={Upn} Nome={DisplayName} Email={Email} Departamento={Department} Cargo={Title} Grupos={GroupsCount}",
-                user.Upn,
-                user.DisplayName,
-                user.Email,
-                user.Department,
-                user.Title,
-                user.Groups.Count);
-
-            if (user.Groups.Count > 0)
-            {
-                _logger.LogInformation(
-                    "Grupos do usuário {Upn}: {Groups}",
-                    user.Upn,
-                    string.Join(", ", user.Groups));
-            }
+                "Usuário autenticado com sucesso. Upn={Upn} Nome={DisplayName} Email={Email}",
+                user.Upn, user.DisplayName, user.Email);
 
             return new AdAuthResult
             {
@@ -122,7 +92,7 @@ public sealed class AdAuthService : IAdAuthService
         }
     }
 
-    private string? ResolveAccessToken(AdAuthRequest? req)
+    private string? ResolveAccessToken()
     {
         var authHeader = _httpContextAccessor.HttpContext?
             .Request.Headers.Authorization
@@ -131,20 +101,13 @@ public sealed class AdAuthService : IAdAuthService
         if (!string.IsNullOrWhiteSpace(authHeader) &&
             authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
         {
-            _logger.LogDebug("Token encontrado no header Authorization.");
             return authHeader["Bearer ".Length..].Trim();
-        }
-
-        if (!string.IsNullOrWhiteSpace(req?.TeamsToken))
-        {
-            _logger.LogDebug("Token encontrado no body como fallback.");
-            return req.TeamsToken.Trim();
         }
 
         return null;
     }
 
-    private async Task<string> ValidateTeamsTokenAsync(string token, CancellationToken ct)
+    private async Task<string> ValidateAccessTokenAsync(string token, CancellationToken ct)
     {
         var metadataUrl = $"https://login.microsoftonline.com/{_azure.TenantId}/v2.0/.well-known/openid-configuration";
 

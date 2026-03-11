@@ -21,7 +21,7 @@ public sealed class AdSsoTool
     }
 
     [McpServerTool]
-    [Description("Autentica automaticamente o usuário atual usando a conexão corporativa e retorna seus dados do Active Directory.")]
+    [Description("Autentica automaticamente o usuário atual usando os headers enviados pela conexão corporativa e retorna seus dados do Active Directory.")]
     public async Task<AdAuthResult> AD_Authenticate(
         RequestContext<CallToolRequestParams> context,
         CancellationToken ct)

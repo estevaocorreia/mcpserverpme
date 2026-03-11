@@ -1,15 +1,16 @@
 ﻿using System.DirectoryServices.Protocols;
-using System.IdentityModel.Tokens.Jwt;
 using System.Net;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+using Azure.Core;
+using Azure.Identity;
 using Mcpserver.Application.Interfaces;
 using Mcpserver.Domain.Contracts.Auth;
 using Mcpserver.Settings;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using Microsoft.IdentityModel.Protocols;
-using Microsoft.IdentityModel.Protocols.OpenIdConnect;
-using Microsoft.IdentityModel.Tokens;
 
 namespace Mcpserver.Infrastructure.Services;
 
@@ -19,6 +20,7 @@ public sealed class AdAuthService : IAdAuthService
     private readonly ActiveDirectorySettings _ad;
     private readonly IHttpContextAccessor _httpContextAccessor;
     private readonly ILogger<AdAuthService> _logger;
+    private readonly HttpClient _httpClient;
 
     public AdAuthService(
         IOptions<AzureAdSettings> azure,
@@ -30,29 +32,71 @@ public sealed class AdAuthService : IAdAuthService
         _ad = ad.Value;
         _httpContextAccessor = httpContextAccessor;
         _logger = logger;
+        _httpClient = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(20)
+        };
     }
 
     public async Task<AdAuthResult> AuthenticateAsync(CancellationToken ct)
     {
-        var accessToken = ResolveAccessToken();
+        var ctx = _httpContextAccessor.HttpContext;
+        if (ctx is null)
+            return Fail("HttpContext não disponível.");
 
-        if (string.IsNullOrWhiteSpace(accessToken))
+        var objectId = ctx.Request.Headers["X-Ms-Client-Object-Id"].FirstOrDefault();
+        var tenantIdHeader = ctx.Request.Headers["X-Ms-Client-Tenant-Id"].FirstOrDefault();
+        var principalId = ctx.Request.Headers["X-Ms-Client-Principal-Id"].FirstOrDefault();
+        var principalHeader = ctx.Request.Headers["X-MS-CLIENT-PRINCIPAL"].FirstOrDefault();
+
+        _logger.LogInformation(
+            "Headers de identidade recebidos. ObjectId={ObjectId} PrincipalId={PrincipalId} TenantIdHeader={TenantIdHeader} HasPrincipalHeader={HasPrincipalHeader}",
+            objectId ?? "null",
+            principalId ?? "null",
+            tenantIdHeader ?? "null",
+            !string.IsNullOrWhiteSpace(principalHeader));
+
+        GraphUserInfo? graphUser = null;
+
+        // 1) Tenta pelo ObjectId que já veio no header
+        if (!string.IsNullOrWhiteSpace(objectId))
         {
-            _logger.LogWarning("Autenticação falhou: token não encontrado no header Authorization.");
-            return Fail("Token de acesso não encontrado no header Authorization.");
+            graphUser = await GetGraphUserByIdAsync(objectId, ct);
         }
 
-        string upn;
-        try
+        // 2) Se não veio ObjectId ou não achou, tenta extrair claims do X-MS-CLIENT-PRINCIPAL
+        if (graphUser is null && !string.IsNullOrWhiteSpace(principalHeader))
         {
-            upn = await ValidateAccessTokenAsync(accessToken, ct);
-            _logger.LogInformation("Token validado com sucesso. UPN={Upn}", upn);
+            var principalData = TryDecodeClientPrincipal(principalHeader);
+            var upnFromClaims =
+                principalData?.FindClaim("preferred_username") ??
+                principalData?.FindClaim("upn") ??
+                principalData?.FindClaim("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn") ??
+                principalData?.FindClaim("email") ??
+                principalData?.FindClaim("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress");
+
+            var oidFromClaims =
+                principalData?.FindClaim("oid") ??
+                principalData?.FindClaim("http://schemas.microsoft.com/identity/claims/objectidentifier");
+
+            _logger.LogInformation(
+                "Claims extraídas do X-MS-CLIENT-PRINCIPAL. UPN={Upn} OID={Oid}",
+                upnFromClaims ?? "null",
+                oidFromClaims ?? "null");
+
+            if (!string.IsNullOrWhiteSpace(oidFromClaims))
+                graphUser = await GetGraphUserByIdAsync(oidFromClaims, ct);
+
+            if (graphUser is null && !string.IsNullOrWhiteSpace(upnFromClaims))
+                graphUser = await GetGraphUserByUpnAsync(upnFromClaims, ct);
         }
-        catch (SecurityTokenException ex)
-        {
-            _logger.LogWarning(ex, "Token inválido ou expirado.");
-            return Fail($"Token inválido ou expirado: {ex.Message}");
-        }
+
+        if (graphUser is null)
+            return Fail("Não foi possível identificar o usuário atual pelos headers recebidos.");
+
+        var upn = graphUser.UserPrincipalName;
+        if (string.IsNullOrWhiteSpace(upn))
+            return Fail("Usuário identificado, mas sem userPrincipalName.");
 
         var samAccount = upn.Split('@')[0];
 
@@ -61,23 +105,36 @@ public sealed class AdAuthService : IAdAuthService
             using var conn = CreateConnection();
             BindServiceAccount(conn);
 
+            _logger.LogInformation(
+                "Consultando usuário no AD. SamAccount={SamAccount} Upn={Upn} Host={Host} BaseDn={BaseDn}",
+                samAccount, upn, _ad.Host, _ad.BaseDn);
+
             var user = SearchUser(conn, samAccount, upn);
 
             if (user is null)
-                return Fail($"Usuário '{upn}' autenticado, mas não encontrado no AD.");
+                return Fail($"Usuário '{upn}' identificado, mas não encontrado no AD.");
 
             if (!user.Enabled)
                 return Fail($"Conta '{samAccount}' está desativada no Active Directory.");
 
+            // Enriquecer com dados do Graph se necessário
+            user.DisplayName ??= graphUser.DisplayName;
+            user.Email ??= graphUser.Mail;
+            user.Upn = upn;
+
             _logger.LogInformation(
-                "Usuário autenticado com sucesso. Upn={Upn} Nome={DisplayName} Email={Email}",
-                user.Upn, user.DisplayName, user.Email);
+                "Usuário autenticado com sucesso. Upn={Upn} Nome={DisplayName} Email={Email} Departamento={Department} Cargo={Title}",
+                user.Upn,
+                user.DisplayName,
+                user.Email,
+                user.Department,
+                user.Title);
 
             return new AdAuthResult
             {
                 Authenticated = true,
                 User = user,
-                Source = "Bearer Token → AD on-premises"
+                Source = "Copilot Headers → Microsoft Graph → AD on-premises"
             };
         }
         catch (LdapException ex)
@@ -92,60 +149,87 @@ public sealed class AdAuthService : IAdAuthService
         }
     }
 
-    private string? ResolveAccessToken()
+    private async Task<GraphUserInfo?> GetGraphUserByIdAsync(string objectId, CancellationToken ct)
     {
-        var authHeader = _httpContextAccessor.HttpContext?
-            .Request.Headers.Authorization
-            .FirstOrDefault();
+        var token = await GetGraphAccessTokenAsync(ct);
 
-        if (!string.IsNullOrWhiteSpace(authHeader) &&
-            authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+        using var req = new HttpRequestMessage(
+            HttpMethod.Get,
+            $"https://graph.microsoft.com/v1.0/users/{Uri.EscapeDataString(objectId)}?$select=id,displayName,mail,userPrincipalName");
+
+        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+        using var resp = await _httpClient.SendAsync(req, ct);
+        var body = await resp.Content.ReadAsStringAsync(ct);
+
+        if (!resp.IsSuccessStatusCode)
         {
-            return authHeader["Bearer ".Length..].Trim();
+            _logger.LogWarning("Graph por ID falhou. Status={Status} Body={Body}", (int)resp.StatusCode, body);
+            return null;
         }
 
-        return null;
+        return JsonSerializer.Deserialize<GraphUserInfo>(body, new JsonSerializerOptions
+        {
+            PropertyNameCaseInsensitive = true
+        });
     }
 
-    private async Task<string> ValidateAccessTokenAsync(string token, CancellationToken ct)
+    private async Task<GraphUserInfo?> GetGraphUserByUpnAsync(string upn, CancellationToken ct)
     {
-        var metadataUrl = $"https://login.microsoftonline.com/{_azure.TenantId}/v2.0/.well-known/openid-configuration";
+        var token = await GetGraphAccessTokenAsync(ct);
 
-        var configMgr = new ConfigurationManager<OpenIdConnectConfiguration>(
-            metadataUrl,
-            new OpenIdConnectConfigurationRetriever(),
-            new HttpDocumentRetriever());
+        using var req = new HttpRequestMessage(
+            HttpMethod.Get,
+            $"https://graph.microsoft.com/v1.0/users/{Uri.EscapeDataString(upn)}?$select=id,displayName,mail,userPrincipalName");
 
-        var config = await configMgr.GetConfigurationAsync(ct);
+        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
-        var validationParams = new TokenValidationParameters
+        using var resp = await _httpClient.SendAsync(req, ct);
+        var body = await resp.Content.ReadAsStringAsync(ct);
+
+        if (!resp.IsSuccessStatusCode)
         {
-            ValidateIssuer = true,
-            ValidIssuers =
-            [
-                $"https://login.microsoftonline.com/{_azure.TenantId}/v2.0",
-                $"https://sts.windows.net/{_azure.TenantId}/"
-            ],
-            ValidateAudience = true,
-            ValidAudience = _azure.ClientId,
-            ValidateLifetime = true,
-            ValidateIssuerSigningKey = true,
-            IssuerSigningKeys = config.SigningKeys,
-            ClockSkew = TimeSpan.FromMinutes(5)
-        };
+            _logger.LogWarning("Graph por UPN falhou. Status={Status} Body={Body}", (int)resp.StatusCode, body);
+            return null;
+        }
 
-        var handler = new JwtSecurityTokenHandler();
-        var principal = handler.ValidateToken(token, validationParams, out _);
+        return JsonSerializer.Deserialize<GraphUserInfo>(body, new JsonSerializerOptions
+        {
+            PropertyNameCaseInsensitive = true
+        });
+    }
 
-        var upn =
-            principal.FindFirst("upn")?.Value ??
-            principal.FindFirst("preferred_username")?.Value ??
-            principal.FindFirst("email")?.Value;
+    private async Task<string> GetGraphAccessTokenAsync(CancellationToken ct)
+    {
+        var credential = new ClientSecretCredential(
+            _azure.TenantId,
+            _azure.ClientId,
+            _azure.ClientSecret);
 
-        if (string.IsNullOrWhiteSpace(upn))
-            throw new SecurityTokenException("Token válido, mas não contém 'upn', 'preferred_username' ou 'email'.");
+        var token = await credential.GetTokenAsync(
+            new TokenRequestContext(new[] { "https://graph.microsoft.com/.default" }),
+            ct);
 
-        return upn;
+        return token.Token;
+    }
+
+    private ClientPrincipalData? TryDecodeClientPrincipal(string value)
+    {
+        try
+        {
+            var bytes = Convert.FromBase64String(value);
+            var json = Encoding.UTF8.GetString(bytes);
+
+            return JsonSerializer.Deserialize<ClientPrincipalData>(json, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Falha ao decodificar X-MS-CLIENT-PRINCIPAL.");
+            return null;
+        }
     }
 
     private LdapConnection CreateConnection()
@@ -223,4 +307,29 @@ public sealed class AdAuthService : IAdAuthService
             Error = error,
             Source = "AD Auth"
         };
+
+    private sealed class GraphUserInfo
+    {
+        public string? Id { get; set; }
+        public string? DisplayName { get; set; }
+        public string? Mail { get; set; }
+        public string? UserPrincipalName { get; set; }
+    }
+
+    private sealed class ClientPrincipalData
+    {
+        public string? IdentityProvider { get; set; }
+        public string? UserId { get; set; }
+        public string? UserDetails { get; set; }
+        public List<ClientPrincipalClaim> Claims { get; set; } = new();
+
+        public string? FindClaim(string type) =>
+            Claims.FirstOrDefault(c => string.Equals(c.Type, type, StringComparison.OrdinalIgnoreCase))?.Value;
+    }
+
+    private sealed class ClientPrincipalClaim
+    {
+        public string? Type { get; set; }
+        public string? Value { get; set; }
+    }
 }

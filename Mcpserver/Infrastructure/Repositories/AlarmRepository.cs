@@ -1,6 +1,7 @@
 ﻿using Dapper;
 using Mcpserver.Application.Interfaces;
 using Mcpserver.Domain.Contracts.Alarms;
+using Mcpserver.Shared.Observability;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Configuration;
 using System.Data;
@@ -20,15 +21,33 @@ public sealed class AlarmRepository : IAlarmRepository
 
     private IDbConnection CreateConn() => new SqlConnection(_connString);
 
-    // ── Colunas ──────────────────────────────────────────────────────────
+    
     public async Task<IReadOnlyList<string>> GetColumnsAsync(CancellationToken ct)
     {
         await EnsureColumnCacheAsync(ct);
         return _columnCache!.OrderBy(c => c).ToArray();
     }
 
-    // ── Query dinâmica (existente) ────────────────────────────────────────
-    public async Task<AlarmQueryResult> QueryAsync(AlarmQueryRequest request, CancellationToken ct)
+
+    public Task<AlarmQueryResult> QueryAsync(AlarmQueryRequest request, CancellationToken ct)
+        => DbActivity.TrackAsync(
+            operationName: "alarm_query",
+            dbStatement: "SELECT * FROM [ION_Data].[dbo].[Alarm]",
+            dbName: "ION_Data",
+            execute: () => QueryInternalAsync(request, ct),
+            rowsSelector: r => r.Returned);
+
+  
+    public Task<AlarmEventResult> GetEventsAsync(AlarmEventRequest request, CancellationToken ct)
+        => DbActivity.TrackAsync(
+            operationName: "sp_MEMT_LLM_Alarmes_EE",
+            dbStatement: "EXEC dbo.sp_MEMT_LLM_Alarmes_EE",
+            dbName: "ION_Data",
+            execute: () => GetEventsInternalAsync(request, ct),
+            rowsSelector: r => r.Returned);
+
+
+    private async Task<AlarmQueryResult> QueryInternalAsync(AlarmQueryRequest request, CancellationToken ct)
     {
         await EnsureColumnCacheAsync(ct);
 
@@ -67,9 +86,7 @@ public sealed class AlarmRepository : IAlarmRepository
             p.Add("@txt", $"%{request.ContainsText.Trim()}%");
             var textCols = await ResolveTextColumnsAsync(request.TextColumns, ct);
             if (textCols.Count > 0)
-            {
                 sql += " AND (" + string.Join(" OR ", textCols.Select(c => $"[{c}] LIKE @txt")) + ")";
-            }
         }
 
         if (!string.IsNullOrWhiteSpace(orderBy))
@@ -89,8 +106,7 @@ public sealed class AlarmRepository : IAlarmRepository
         return new AlarmQueryResult { Returned = list.Count, Rows = list };
     }
 
-    // ── SP sp_MEMT_LLM_Alarmes_EE ────────────────────────────────────────
-    public async Task<AlarmEventResult> GetEventsAsync(AlarmEventRequest request, CancellationToken ct)
+    private async Task<AlarmEventResult> GetEventsInternalAsync(AlarmEventRequest request, CancellationToken ct)
     {
         const string sp = "dbo.sp_MEMT_LLM_Alarmes_EE";
 
@@ -103,22 +119,16 @@ public sealed class AlarmRepository : IAlarmRepository
 
         using var conn = CreateConn();
         var rows = await conn.QueryAsync(
-            new CommandDefinition(sp, p, commandType: CommandType.StoredProcedure, cancellationToken: ct)
-        );
+            new CommandDefinition(sp, p, commandType: CommandType.StoredProcedure, cancellationToken: ct));
 
         var list = rows.Select(r =>
             ((IDictionary<string, object?>)r).ToDictionary(k => k.Key, v => v.Value)
         ).ToList();
 
-        return new AlarmEventResult
-        {
-            Returned = list.Count,
-            Rows = list,
-            Source = sp
-        };
+        return new AlarmEventResult { Returned = list.Count, Rows = list, Source = sp };
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────
+   
     private async Task EnsureColumnCacheAsync(CancellationToken ct)
     {
         if (_columnCache is not null) return;

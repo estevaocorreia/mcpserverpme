@@ -129,7 +129,7 @@ public sealed class AdAuthService : IAdAuthService
                 Source = "Copilot Headers → Microsoft Graph → AD on-premises"
             };
         }
-        catch (LdapException ex)
+        catch (Novell.Directory.Ldap.LdapException ex)
         {
             _logger.LogError(ex, "Erro LDAP ao autenticar usuário. Upn={Upn}", upn);
             return Fail($"Erro LDAP: {ex.Message}");
@@ -151,14 +151,14 @@ public sealed class AdAuthService : IAdAuthService
         var filter = $"(&(objectClass=user)(objectCategory=person)(sAMAccountName={Escape(samAccount)}))";
         var attrs = new[]
         {
-        "sAMAccountName",
-        "displayName",
-        "mail",
-        "department",
-        "title",
-        "memberOf",
-        "userAccountControl"
-    };
+            "sAMAccountName",
+            "displayName",
+            "mail",
+            "department",
+            "title",
+            "memberOf",
+            "userAccountControl"
+        };
 
         var search = await conn.SearchAsync(
             _ad.BaseDn,
@@ -173,17 +173,26 @@ public sealed class AdAuthService : IAdAuthService
         {
             var attrSet = entry.GetAttributeSet();
 
-            var username = attrSet.GetAttribute("sAMAccountName")?.StringValue;
-            var displayName = attrSet.GetAttribute("displayName")?.StringValue;
-            var email = attrSet.GetAttribute("mail")?.StringValue;
-            var department = attrSet.GetAttribute("department")?.StringValue;
-            var title = attrSet.GetAttribute("title")?.StringValue;
+            var username = GetAttributeValueSafe(attrSet, "sAMAccountName");
+            var displayName = GetAttributeValueSafe(attrSet, "displayName");
+            var email = GetAttributeValueSafe(attrSet, "mail");
+            var department = GetAttributeValueSafe(attrSet, "department");
+            var title = GetAttributeValueSafe(attrSet, "title");
 
-            var uacRaw = attrSet.GetAttribute("userAccountControl")?.StringValue ?? "0";
+            var uacRaw = GetAttributeValueSafe(attrSet, "userAccountControl") ?? "0";
             var uac = int.TryParse(uacRaw, out var parsed) ? parsed : 0;
 
             var groups = new List<string>();
-            var memberOf = attrSet.GetAttribute("memberOf");
+            Novell.Directory.Ldap.LdapAttribute? memberOf = null;
+
+            try
+            {
+                memberOf = attrSet.GetAttribute("memberOf");
+            }
+            catch (KeyNotFoundException)
+            {
+                memberOf = null;
+            }
 
             if (memberOf != null)
             {
@@ -213,6 +222,18 @@ public sealed class AdAuthService : IAdAuthService
         }
 
         return null;
+    }
+
+    private static string? GetAttributeValueSafe(Novell.Directory.Ldap.LdapAttributeSet attrSet, string attributeName)
+    {
+        try
+        {
+            return attrSet.GetAttribute(attributeName)?.StringValue;
+        }
+        catch (KeyNotFoundException)
+        {
+            return null;
+        }
     }
 
     private async Task<GraphUserInfo?> GetGraphUserByIdAsync(string objectId, CancellationToken ct)

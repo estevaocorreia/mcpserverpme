@@ -234,18 +234,18 @@ public sealed class AdAuthService : IAdAuthService
 
     private LdapConnection CreateConnection()
     {
-        var identifier = new LdapDirectoryIdentifier(_ad.Host, _ad.Port, false, false);
+        var identifier = new LdapDirectoryIdentifier(_ad.Host, _ad.Port);
+        var credential = new NetworkCredential(_ad.BindUser, _ad.BindPass);
 
-        // Formato: usuário, senha, domínio NetBIOS
-        var credential = new NetworkCredential(_ad.BindUser, _ad.BindPass, "memt");
-
-        var conn = new LdapConnection(identifier, credential, AuthType.Negotiate)
+        var conn = new LdapConnection(identifier, credential, AuthType.Basic)
         {
             Timeout = TimeSpan.FromSeconds(10)
         };
 
         conn.SessionOptions.ProtocolVersion = 3;
-        conn.SessionOptions.ReferralChasing = ReferralChasingOptions.None;
+
+        if (_ad.UseSsl)
+            conn.SessionOptions.SecureSocketLayer = true;
 
         return conn;
     }

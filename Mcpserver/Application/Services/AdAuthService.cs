@@ -1,6 +1,4 @@
-﻿using System.DirectoryServices.Protocols;
-using System.Net;
-using System.Net.Http.Headers;
+﻿using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using Azure.Core;
@@ -11,6 +9,7 @@ using Mcpserver.Settings;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Novell.Directory.Ldap;
 
 namespace Mcpserver.Infrastructure.Services;
 
@@ -58,16 +57,13 @@ public sealed class AdAuthService : IAdAuthService
 
         GraphUserInfo? graphUser = null;
 
-        // 1) Tenta pelo ObjectId que já veio no header
         if (!string.IsNullOrWhiteSpace(objectId))
-        {
             graphUser = await GetGraphUserByIdAsync(objectId, ct);
-        }
 
-        // 2) Se não veio ObjectId ou não achou, tenta extrair claims do X-MS-CLIENT-PRINCIPAL
         if (graphUser is null && !string.IsNullOrWhiteSpace(principalHeader))
         {
             var principalData = TryDecodeClientPrincipal(principalHeader);
+
             var upnFromClaims =
                 principalData?.FindClaim("preferred_username") ??
                 principalData?.FindClaim("upn") ??
@@ -98,18 +94,15 @@ public sealed class AdAuthService : IAdAuthService
         if (string.IsNullOrWhiteSpace(upn))
             return Fail("Usuário identificado, mas sem userPrincipalName.");
 
-        var samAccount = upn.Split('@')[0];
+        var samAccount = upn.Contains('@') ? upn.Split('@')[0] : upn;
 
         try
         {
-            using var conn = CreateConnection();
-            BindServiceAccount(conn);
-
             _logger.LogInformation(
                 "Consultando usuário no AD. SamAccount={SamAccount} Upn={Upn} Host={Host} BaseDn={BaseDn}",
                 samAccount, upn, _ad.Host, _ad.BaseDn);
 
-            var user = SearchUser(conn, samAccount, upn);
+            var user = await SearchUserInAdAsync(samAccount, upn, ct);
 
             if (user is null)
                 return Fail($"Usuário '{upn}' identificado, mas não encontrado no AD.");
@@ -117,7 +110,6 @@ public sealed class AdAuthService : IAdAuthService
             if (!user.Enabled)
                 return Fail($"Conta '{samAccount}' está desativada no Active Directory.");
 
-            // Enriquecer com dados do Graph se necessário
             user.DisplayName ??= graphUser.DisplayName;
             user.Email ??= graphUser.Mail;
             user.Upn = upn;
@@ -140,13 +132,87 @@ public sealed class AdAuthService : IAdAuthService
         catch (LdapException ex)
         {
             _logger.LogError(ex, "Erro LDAP ao autenticar usuário. Upn={Upn}", upn);
-            return Fail($"Erro LDAP ({ex.ErrorCode}): {ex.Message}");
+            return Fail($"Erro LDAP: {ex.Message}");
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Erro inesperado ao autenticar usuário. Upn={Upn}", upn);
             return Fail($"Erro inesperado: {ex.Message}");
         }
+    }
+
+    private async Task<AdUserDto?> SearchUserInAdAsync(string samAccount, string upn, CancellationToken ct)
+    {
+        using var conn = new Novell.Directory.Ldap.LdapConnection();
+
+        await conn.ConnectAsync(_ad.Host, _ad.Port, ct);
+        await conn.BindAsync(_ad.BindUser, _ad.BindPass, ct);
+
+        var filter = $"(&(objectClass=user)(objectCategory=person)(sAMAccountName={Escape(samAccount)}))";
+        var attrs = new[]
+        {
+        "sAMAccountName",
+        "displayName",
+        "mail",
+        "department",
+        "title",
+        "memberOf",
+        "userAccountControl"
+    };
+
+        var search = await conn.SearchAsync(
+            _ad.BaseDn,
+            Novell.Directory.Ldap.LdapConnection.ScopeSub,
+            filter,
+            attrs,
+            false,
+            ct
+        );
+
+        await foreach (var entry in search.WithCancellation(ct))
+        {
+            var attrSet = entry.GetAttributeSet();
+
+            var username = attrSet.GetAttribute("sAMAccountName")?.StringValue;
+            var displayName = attrSet.GetAttribute("displayName")?.StringValue;
+            var email = attrSet.GetAttribute("mail")?.StringValue;
+            var department = attrSet.GetAttribute("department")?.StringValue;
+            var title = attrSet.GetAttribute("title")?.StringValue;
+
+            var uacRaw = attrSet.GetAttribute("userAccountControl")?.StringValue ?? "0";
+            var uac = int.TryParse(uacRaw, out var parsed) ? parsed : 0;
+
+            var groups = new List<string>();
+            var memberOf = attrSet.GetAttribute("memberOf");
+
+            if (memberOf != null)
+            {
+                foreach (var dn in memberOf.StringValueArray)
+                {
+                    var cn = dn
+                        .Split(',')
+                        .FirstOrDefault(p => p.StartsWith("CN=", StringComparison.OrdinalIgnoreCase))
+                        ?.Substring(3);
+
+                    if (!string.IsNullOrWhiteSpace(cn))
+                        groups.Add(cn);
+                }
+            }
+
+            return new AdUserDto
+            {
+                Username = username,
+                Upn = upn,
+                DisplayName = displayName,
+                Email = email,
+                Department = department,
+                Title = title,
+                Enabled = (uac & 0x2) == 0,
+                Groups = groups
+            };
+        }
+
+        return null;
     }
 
     private async Task<GraphUserInfo?> GetGraphUserByIdAsync(string objectId, CancellationToken ct)
@@ -230,71 +296,6 @@ public sealed class AdAuthService : IAdAuthService
             _logger.LogWarning(ex, "Falha ao decodificar X-MS-CLIENT-PRINCIPAL.");
             return null;
         }
-    }
-
-    private LdapConnection CreateConnection()
-    {
-        var identifier = new LdapDirectoryIdentifier(_ad.Host, _ad.Port);
-        var credential = new NetworkCredential(_ad.BindUser, _ad.BindPass);
-
-        var conn = new LdapConnection(identifier, credential, AuthType.Basic)
-        {
-            Timeout = TimeSpan.FromSeconds(10)
-        };
-
-        conn.SessionOptions.ProtocolVersion = 3;
-
-        if (_ad.UseSsl)
-            conn.SessionOptions.SecureSocketLayer = true;
-
-        return conn;
-    }
-
-    private void BindServiceAccount(LdapConnection conn)
-    {
-        conn.Bind();
-    }
-
-    private AdUserDto? SearchUser(LdapConnection conn, string samAccount, string upn)
-    {
-        var filter = $"(&(objectClass=user)(objectCategory=person)(!(userAccountControl:1.2.840.113556.1.4.803:=2))(sAMAccountName={Escape(samAccount)}))";
-        var attrs = new[] { "sAMAccountName", "displayName", "mail", "department", "title", "memberOf", "userAccountControl" };
-
-        var resp = (SearchResponse)conn.SendRequest(
-            new SearchRequest(_ad.BaseDn, filter, SearchScope.Subtree, attrs));
-
-        if (resp.Entries.Count == 0)
-            return null;
-
-        var e = resp.Entries[0];
-        var uac = int.Parse(e.Attributes["userAccountControl"]?[0]?.ToString() ?? "0");
-        var groups = new List<string>();
-
-        if (e.Attributes["memberOf"] is not null)
-        {
-            foreach (var dn in e.Attributes["memberOf"])
-            {
-                var cn = dn.ToString()!
-                    .Split(',')
-                    .FirstOrDefault(p => p.StartsWith("CN=", StringComparison.OrdinalIgnoreCase))
-                    ?.Substring(3);
-
-                if (cn is not null)
-                    groups.Add(cn);
-            }
-        }
-
-        return new AdUserDto
-        {
-            Username = e.Attributes["sAMAccountName"]?[0]?.ToString(),
-            Upn = upn,
-            DisplayName = e.Attributes["displayName"]?[0]?.ToString(),
-            Email = e.Attributes["mail"]?[0]?.ToString(),
-            Department = e.Attributes["department"]?[0]?.ToString(),
-            Title = e.Attributes["title"]?[0]?.ToString(),
-            Enabled = (uac & 0x2) == 0,
-            Groups = groups
-        };
     }
 
     private static string Escape(string v) =>

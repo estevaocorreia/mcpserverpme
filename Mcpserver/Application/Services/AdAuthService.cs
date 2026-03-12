@@ -234,9 +234,11 @@ public sealed class AdAuthService : IAdAuthService
 
     private LdapConnection CreateConnection()
     {
-        var conn = new LdapConnection(new LdapDirectoryIdentifier(_ad.Host, _ad.Port))
+        var identifier = new LdapDirectoryIdentifier(_ad.Host, _ad.Port);
+        var credential = new NetworkCredential(_ad.BindUser, _ad.BindPass);
+
+        var conn = new LdapConnection(identifier, credential, AuthType.Basic)
         {
-            AuthType = AuthType.Basic,
             Timeout = TimeSpan.FromSeconds(10)
         };
 
@@ -248,8 +250,10 @@ public sealed class AdAuthService : IAdAuthService
         return conn;
     }
 
-    private void BindServiceAccount(LdapConnection conn) =>
-        conn.Bind(new NetworkCredential(_ad.BindUser, _ad.BindPass));
+    private void BindServiceAccount(LdapConnection conn)
+    {
+        conn.Bind();
+    }
 
     private AdUserDto? SearchUser(LdapConnection conn, string samAccount, string upn)
     {

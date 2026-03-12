@@ -253,7 +253,7 @@ public sealed class AdAuthService : IAdAuthService
 
     private AdUserDto? SearchUser(LdapConnection conn, string samAccount, string upn)
     {
-        var filter = $"(&(objectClass=user)(|(sAMAccountName={Escape(samAccount)})(userPrincipalName={Escape(upn)})))";
+        var filter = $"(&(objectClass=user)(objectCategory=person)(!(userAccountControl:1.2.840.113556.1.4.803:=2))(sAMAccountName={Escape(samAccount)}))";
         var attrs = new[] { "sAMAccountName", "displayName", "mail", "department", "title", "memberOf", "userAccountControl" };
 
         var resp = (SearchResponse)conn.SendRequest(
